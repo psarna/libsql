@@ -371,8 +371,9 @@ void sqlite3InsertBuiltinFuncs(
     }
   }
 }
-  
-  
+
+// libSQL
+void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv);
 
 /*
 ** Locate a user function given a name, a number of arguments and a flag
@@ -405,6 +406,9 @@ FuncDef *sqlite3FindFunction(
   int bestScore = 0;  /* Score of best match */
   int h;              /* Hash value */
   int nName;          /* Length of the name */
+
+  const unsigned char *pBody = NULL;
+  int nBody = 0;
 
   assert( nArg>=(-2) );
   assert( nArg>=(-1) || createFlag==0 );
@@ -474,6 +478,42 @@ FuncDef *sqlite3FindFunction(
   if( pBest && (pBest->xSFunc || createFlag) ){
     return pBest;
   }
+
+//////////////////////////////////////////
+  fprintf(stderr, "Looking for function %s in the Wasm table\n", zName);
+
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_prepare_v2(db, "SELECT body FROM wasm_func_table WHERE name = ?", -1, &stmt, 0);
+  sqlite3_bind_text(stmt, 1, zName, -1, SQLITE_STATIC);
+  
+  if (rc != SQLITE_OK) {
+      return 0;
+  }    
+  
+  rc = sqlite3_step(stmt);
+  if (rc == SQLITE_ROW) {
+    pBody = sqlite3_column_text(stmt, 0);
+    nBody = sqlite3Strlen30(pBody);
+
+    // FIXME: Memory leak! Yay
+    pBest = sqlite3DbMallocZero(db, sizeof(*pBest)+nName+1+nBody+1);
+    memcpy(&pBest[1], zName, nName + 1);
+    memcpy((char*)&pBest[1] + nName + 1, pBody, nBody);
+
+    pBest->funcFlags = 0;
+    pBest->xSFunc = run_wasm;
+    pBest->xFinalize = NULL;
+    pBest->xValue = NULL;
+    pBest->xInverse = NULL;
+    pBest->pUserData = &pBest[1];
+    pBest->nArg = (i8)nArg;
+
+    sqlite3_finalize(stmt);
+    return pBest;
+  }
+  sqlite3_finalize(stmt);
+//////////////////////////////////////////
+
   return 0;
 }
 

@@ -2196,6 +2196,115 @@ static void signFunc(
   sqlite3_result_int(context, x<0.0 ? -1 : x>0.0 ? +1 : 0);
 }
 
+/////////////////// libSQL extension. TODO: wrap in #ifdef
+#include <stdio.h>
+#include <stdlib.h>
+#include <wasm.h>
+#include <wasmtime.h>
+#include <wasmtime/error.h>
+
+static int maybe_handle_wasm_error(sqlite3_context *context, wasmtime_error_t *error) {
+    if (error) {
+        wasm_name_t message;
+        wasmtime_error_message(error, &message);
+        sqlite3_result_error(context, message.data, -1);
+        wasm_byte_vec_delete(&message);
+        return 1;
+    }
+    return 0;
+}
+
+void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    void *user_data = sqlite3_user_data(context);
+
+    const char *func_name = (const char *)user_data;
+    // Wasm source code - consider storing a compiled binary blob instead
+    const char *src = (const char *)user_data + strlen(func_name) + 1;
+
+    wasm_engine_t *engine = wasm_engine_new();
+    wasmtime_store_t *store = wasmtime_store_new(engine, NULL, NULL);
+    wasmtime_context_t *wasm_ctx = wasmtime_store_context(store);
+
+    wasm_byte_vec_t wasm;
+    wasmtime_error_t *error = wasmtime_wat2wasm(src, strlen(src), &wasm);
+    if (maybe_handle_wasm_error(context, error)) {
+        return;
+    }
+
+    // Compile & instantiate the module (should be done once)
+    wasmtime_module_t *module = NULL;
+    error = wasmtime_module_new(engine, (uint8_t *)wasm.data, wasm.size, &module);
+    if (maybe_handle_wasm_error(context, error)) {
+        return;
+    }
+    wasm_byte_vec_delete(&wasm);
+
+    wasm_trap_t *trap = NULL;
+    wasmtime_instance_t instance;
+    error = wasmtime_instance_new(wasm_ctx, module, NULL, 0, &instance, &trap);
+    if (maybe_handle_wasm_error(context, error)) {
+        return;
+    }
+
+    // Lookup the target function
+    wasmtime_extern_t func;
+    bool ok = wasmtime_instance_export_get(wasm_ctx, &instance, func_name, strlen(func_name), &func);
+    if (!ok) {
+        sqlite3_result_error(context, "Failed to extract function from the Wasm module", -1);
+        return;
+    }
+    if (func.kind != WASMTIME_EXTERN_FUNC) {
+        sqlite3_result_error(context, "Found exported symbol, but it's not a function", -1);
+        return;
+    }
+
+    wasmtime_val_t params[argc];
+    for (unsigned i = 0; i < argc; ++i) {
+        switch (sqlite3_value_type(argv[i])) {
+        case SQLITE_INTEGER:
+            params[i].kind = WASMTIME_I64;
+            params[i].of.i64 = sqlite3_value_int(argv[i]);
+            break;
+        case SQLITE_FLOAT:
+            params[i].kind = WASMTIME_F64;
+            params[i].of.f64 = sqlite3_value_double(argv[i]);
+            break;
+        case SQLITE_TEXT:
+            assert(!"not implemented yet");
+            // params[i].kind = WASMTIME_I32; // pointer
+            //  use sqlite3_value_text and copy it to module memory, then pass a pointer
+            break;
+        case SQLITE_BLOB:
+            assert(!"not implemented yet");
+            // params[i].kind = WASMTIME_I32; // pointer
+            //  use sqlite3_value_text and copy it to module memory, then pass a pointer + size, or make an indirect structure
+            break;
+        case SQLITE_NULL:
+            params[i].kind = WASMTIME_I32;
+            params[i].of.i32 = 0;
+            break;
+        }
+    }
+
+    wasmtime_val_t results[1];
+    error = wasmtime_func_call(wasm_ctx, &func.of.func, params, 1, results, 1, &trap);
+    if (maybe_handle_wasm_error(context, error)) {
+        return;
+    }
+
+    switch (results[0].kind) {
+    case WASMTIME_I64:
+        sqlite3_result_int(context, results[0].of.i64);
+        break;
+    case WASMTIME_F64:
+        sqlite3_result_double(context, results[0].of.f64);
+        break;
+    case WASMTIME_I32:
+        assert(!"not implemented yet");
+        break;
+    }
+}
+
 /*
 ** All of the FuncDef structures in the aBuiltinFunc[] array above
 ** to the global function hash table.  This occurs at start-time (as
