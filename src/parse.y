@@ -180,6 +180,14 @@ cmd ::= ROLLBACK trans_opt TO savepoint_opt nm(X). {
   sqlite3Savepoint(pParse, SAVEPOINT_ROLLBACK, &X);
 }
 
+///////////////////// The CREATE FUNCTION statement /////////////////////////
+//
+
+cmd ::= createkw FUNCTION nm(N) LANGUAGE nm(L) AS STRING(B). {
+  fprintf(stderr, "Creating function %.*s LANGUAGE %.*s!\n"
+                  "\tBody: %.*s\n", N.n, N.z, L.n, L.z, B.n, B.z);
+}
+
 ///////////////////// The CREATE TABLE statement ////////////////////////////
 //
 cmd ::= create_table create_table_args.
@@ -235,7 +243,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
 // at the beginning.
 //
 %token ABORT ACTION AFTER ANALYZE ASC ATTACH BEFORE BEGIN BY CASCADE CAST.
-%token CONFLICT DATABASE DEFERRED DESC DETACH EACH END EXCLUSIVE EXPLAIN FAIL.
+%token CONFLICT DATABASE DEFERRED DESC DETACH EACH END EXCLUSIVE EXPLAIN FAIL FUNCTION.
 %token OR AND NOT IS MATCH LIKE_KW BETWEEN IN ISNULL NOTNULL NE EQ.
 %token GT LE LT GE ESCAPE.
 
@@ -246,7 +254,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
 %fallback ID
   ABORT ACTION AFTER ANALYZE ASC ATTACH BEFORE BEGIN BY CASCADE CAST COLUMNKW
   CONFLICT DATABASE DEFERRED DESC DETACH DO
-  EACH END EXCLUSIVE EXPLAIN FAIL FOR
+  EACH END EXCLUSIVE EXPLAIN FAIL FOR FUNCTION
   IGNORE IMMEDIATE INITIALLY INSTEAD LIKE_KW MATCH NO PLAN
   QUERY KEY OF OFFSET PRAGMA RAISE RECURSIVE RELEASE REPLACE RESTRICT ROW ROWS
   ROLLBACK SAVEPOINT TEMP TRIGGER VACUUM VIEW VIRTUAL WITH WITHOUT
