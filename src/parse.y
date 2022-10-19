@@ -180,14 +180,6 @@ cmd ::= ROLLBACK trans_opt TO savepoint_opt nm(X). {
   sqlite3Savepoint(pParse, SAVEPOINT_ROLLBACK, &X);
 }
 
-///////////////////// The CREATE FUNCTION statement /////////////////////////
-//
-
-cmd ::= createkw FUNCTION nm(N) LANGUAGE nm(L) AS STRING(B). {
-  fprintf(stderr, "Creating function %.*s LANGUAGE %.*s!\n"
-                  "\tBody: %.*s\n", N.n, N.z, L.n, L.z, B.n, B.z);
-}
-
 ///////////////////// The CREATE TABLE statement ////////////////////////////
 //
 cmd ::= create_table create_table_args.
@@ -491,6 +483,22 @@ cmd ::= DROP VIEW ifexists(E) fullname(X). {
   sqlite3DropTable(pParse, X, 1, E);
 }
 %endif  SQLITE_OMIT_VIEW
+
+%ifdef LIBSQL_ENABLE_WASM_RUNTIME
+///////////////////// The CREATE FUNCTION statement /////////////////////////
+//
+
+cmd ::= createkw FUNCTION ifnotexists(E) nm(N) LANGUAGE nm(L) AS STRING(B). {
+  libsql_create_function(pParse, &N, &L, &B, E);
+}
+
+///////////////////// The DROP FUNCTION statement ///////////////////////////
+//
+
+cmd ::= DROP FUNCTION ifexists(E) nm(N). {
+  libsql_drop_function(pParse, &N, E);
+}
+%endif
 
 //////////////////////// The SELECT statement /////////////////////////////////
 //
