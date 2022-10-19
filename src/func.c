@@ -2578,3 +2578,9 @@ void sqlite3RegisterBuiltinFunctions(void){
   }
 #endif
 }
+
+#ifdef LIBSQL_ENABLE_WASM_RUNTIME
+int libsql_initialize_wasm_func_table(sqlite3 *db) {
+  return sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS libsql_wasm_func_table (name text PRIMARY KEY, body text)", NULL, NULL, NULL);
+}
+#endif
