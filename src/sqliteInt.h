@@ -1530,6 +1530,8 @@ void sqlite3CryptFunc(sqlite3_context*,int,sqlite3_value**);
 */
 #define SQLITE_MAX_DB (SQLITE_MAX_ATTACHED+2)
 
+typedef struct libsql_wal_methods libsql_wal_methods;
+
 /*
 ** Each database connection is an instance of the following structure.
 */
@@ -1673,6 +1675,7 @@ struct sqlite3 {
 #ifdef SQLITE_USER_AUTHENTICATION
   sqlite3_userauth auth;        /* User authentication information */
 #endif
+  libsql_wal_methods* pWalMethods; /* Custom WAL methods */
 };
 
 /*
@@ -4603,8 +4606,8 @@ void sqlite3AddCollateType(Parse*, Token*);
 void sqlite3AddGenerated(Parse*,Expr*,Token*);
 void sqlite3EndTable(Parse*,Token*,Token*,u32,Select*);
 void sqlite3AddReturning(Parse*,ExprList*);
-int sqlite3ParseUri(const char*,const char*,unsigned int*,
-                    sqlite3_vfs**,char**,char **);
+int sqlite3ParseUri(const char*,const char*,const char*,unsigned int*,
+                    sqlite3_vfs**,libsql_wal_methods**,char**,char **);
 #define sqlite3CodecQueryParameters(A,B,C) 0
 Btree *sqlite3DbNameToBtree(sqlite3*,const char*);
 

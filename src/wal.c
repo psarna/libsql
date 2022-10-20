@@ -247,6 +247,7 @@
 ** that correspond to frames greater than the new K value are removed
 ** from the hash table at this point.
 */
+#include "sqliteInt.h"
 #ifndef SQLITE_OMIT_WAL
 
 #include "wal.h"
@@ -537,6 +538,7 @@ struct Wal {
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
   sqlite3 *db;
 #endif
+  libsql_wal_methods *pMethods; /* Virtual methods for interacting with WAL */;
 };
 
 /*
@@ -1460,6 +1462,8 @@ static void walIndexClose(Wal *pWal, int isDelete){
 ** already be opened on connection pDbFd. The buffer that zWalName points
 ** to must remain valid for the lifetime of the returned Wal* handle.
 **
+** Custom virtual methods may be provided via the pMethods parameter.
+**
 ** A SHARED lock should be held on the database file when this function
 ** is called. The purpose of this SHARED lock is to prevent any other
 ** client from unlinking the WAL or wal-index file. If another process
@@ -1470,12 +1474,13 @@ static void walIndexClose(Wal *pWal, int isDelete){
 ** *ppWal is set to point to a new WAL handle. If an error occurs,
 ** an SQLite error code is returned and *ppWal is left unmodified.
 */
-int sqlite3WalOpen(
+static int sqlite3WalOpen(
   sqlite3_vfs *pVfs,              /* vfs module to open wal and wal-index */
   sqlite3_file *pDbFd,            /* The open database file */
   const char *zWalName,           /* Name of the WAL file */
   int bNoShm,                     /* True to run in heap-memory mode */
   i64 mxWalSize,                  /* Truncate WAL to this size on reset */
+  libsql_wal_methods* pMethods,   /* Virtual methods for interacting with WAL */
   Wal **ppWal                     /* OUT: Allocated Wal handle */
 ){
   int rc;                         /* Return Code */
@@ -1567,13 +1572,14 @@ int sqlite3WalOpen(
     *ppWal = pRet;
     WALTRACE(("WAL%d: opened\n", pRet));
   }
+  pRet->pMethods = pMethods;
   return rc;
 }
 
 /*
 ** Change the size to which the WAL file is trucated on each reset.
 */
-void sqlite3WalLimit(Wal *pWal, i64 iLimit){
+static void sqlite3WalLimit(Wal *pWal, i64 iLimit){
   if( pWal ) pWal->mxWalSize = iLimit;
 }
 
@@ -1890,7 +1896,7 @@ static void walDisableBlocking(Wal *pWal){
 **
 ** If the bLock parameter is false and the WRITER lock is held, release it.
 */
-int sqlite3WalWriteLock(Wal *pWal, int bLock){
+static int sqlite3WalWriteLock(Wal *pWal, int bLock){
   int rc = SQLITE_OK;
   assert( pWal->readLock<0 || bLock==0 );
   if( bLock ){
@@ -1910,13 +1916,6 @@ int sqlite3WalWriteLock(Wal *pWal, int bLock){
 }
 
 /*
-** Set the database handle used to determine if blocking locks are required.
-*/
-void sqlite3WalDb(Wal *pWal, sqlite3 *db){
-  pWal->db = db;
-}
-
-/*
 ** Take an exclusive WRITE lock. Blocking if so configured.
 */
 static int walLockWriter(Wal *pWal){
@@ -1930,9 +1929,16 @@ static int walLockWriter(Wal *pWal){
 # define walEnableBlocking(x) 0
 # define walDisableBlocking(x)
 # define walLockWriter(pWal) walLockExclusive((pWal), WAL_WRITE_LOCK, 1)
-# define sqlite3WalDb(pWal, db)
 #endif   /* ifdef SQLITE_ENABLE_SETLK_TIMEOUT */
 
+/*
+** Set the database handle used to determine if blocking locks are required.
+*/
+static void sqlite3WalDb(Wal *pWal, sqlite3 *db){
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  pWal->db = db;
+#endif
+}
 
 /*
 ** Attempt to obtain the exclusive WAL lock defined by parameters lockIdx and
@@ -2235,7 +2241,7 @@ static void walLimitSize(Wal *pWal, i64 nMax){
 /*
 ** Close a connection to a log file.
 */
-int sqlite3WalClose(
+static int sqlite3WalClose(
   Wal *pWal,                      /* Wal to close */
   sqlite3 *db,                    /* For interrupt flag */
   int sync_flags,                 /* Flags to pass to OsSync() (or 0) */
@@ -2260,7 +2266,7 @@ int sqlite3WalClose(
       if( pWal->exclusiveMode==WAL_NORMAL_MODE ){
         pWal->exclusiveMode = WAL_EXCLUSIVE_MODE;
       }
-      rc = sqlite3WalCheckpoint(pWal, db, 
+      rc = pWal->pMethods->xCheckpoint(pWal, db, 
           SQLITE_CHECKPOINT_PASSIVE, 0, 0, sync_flags, nBuf, zBuf, 0, 0
       );
       if( rc==SQLITE_OK ){
@@ -2651,7 +2657,7 @@ static int walBeginShmUnreliable(Wal *pWal, int *pChanged){
       pWal->apWiData[i] = 0;
     }
     pWal->bShmUnreliable = 0;
-    sqlite3WalEndReadTransaction(pWal);
+    pWal->pMethods->xEndReadTransaction(pWal);
     *pChanged = 1;
   }
   return rc;
@@ -2937,7 +2943,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int cnt){
 ** error occurs. It is not an error if nBackfillAttempted cannot be
 ** decreased at all.
 */
-int sqlite3WalSnapshotRecover(Wal *pWal){
+static int sqlite3WalSnapshotRecover(Wal *pWal){
   int rc;
 
   assert( pWal->readLock>=0 );
@@ -3008,7 +3014,7 @@ int sqlite3WalSnapshotRecover(Wal *pWal){
 ** Pager layer will use this to know that its cache is stale and
 ** needs to be flushed.
 */
-int sqlite3WalBeginReadTransaction(Wal *pWal, int *pChanged){
+static int sqlite3WalBeginReadTransaction(Wal *pWal, int *pChanged){
   int rc;                         /* Return code */
   int cnt = 0;                    /* Number of TryBeginRead attempts */
 #ifdef SQLITE_ENABLE_SNAPSHOT
@@ -3097,7 +3103,7 @@ int sqlite3WalBeginReadTransaction(Wal *pWal, int *pChanged){
       pWal->minFrame = 1;
 
       if( rc!=SQLITE_OK ){
-        sqlite3WalEndReadTransaction(pWal);
+        pWal->pMethods->xEndReadTransaction(pWal);
       }
     }
   }
@@ -3116,8 +3122,8 @@ int sqlite3WalBeginReadTransaction(Wal *pWal, int *pChanged){
 ** Finish with a read transaction.  All this does is release the
 ** read-lock.
 */
-void sqlite3WalEndReadTransaction(Wal *pWal){
-  sqlite3WalEndWriteTransaction(pWal);
+static void sqlite3WalEndReadTransaction(Wal *pWal){
+  pWal->pMethods->xEndWriteTransaction(pWal);
   if( pWal->readLock>=0 ){
     walUnlockShared(pWal, WAL_READ_LOCK(pWal->readLock));
     pWal->readLock = -1;
@@ -3132,7 +3138,7 @@ void sqlite3WalEndReadTransaction(Wal *pWal){
 ** Return SQLITE_OK if successful, or an error code if an error occurs. If an
 ** error does occur, the final value of *piRead is undefined.
 */
-int sqlite3WalFindFrame(
+static int sqlite3WalFindFrame(
   Wal *pWal,                      /* WAL handle */
   Pgno pgno,                      /* Database page number to read data for */
   u32 *piRead                     /* OUT: Frame number (or zero) */
@@ -3236,7 +3242,7 @@ int sqlite3WalFindFrame(
 ** (which is nOut bytes in size). Return SQLITE_OK if successful, or an
 ** error code otherwise.
 */
-int sqlite3WalReadFrame(
+static int sqlite3WalReadFrame(
   Wal *pWal,                      /* WAL handle */
   u32 iRead,                      /* Frame to read */
   int nOut,                       /* Size of buffer pOut in bytes */
@@ -3256,7 +3262,7 @@ int sqlite3WalReadFrame(
 /* 
 ** Return the size of the database in pages (or zero, if unknown).
 */
-Pgno sqlite3WalDbsize(Wal *pWal){
+static Pgno sqlite3WalDbsize(Wal *pWal){
   if( pWal && ALWAYS(pWal->readLock>=0) ){
     return pWal->hdr.nPage;
   }
@@ -3277,7 +3283,7 @@ Pgno sqlite3WalDbsize(Wal *pWal){
 **
 ** There can only be a single writer active at a time.
 */
-int sqlite3WalBeginWriteTransaction(Wal *pWal){
+static int sqlite3WalBeginWriteTransaction(Wal *pWal){
   int rc;
 
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
@@ -3325,7 +3331,7 @@ int sqlite3WalBeginWriteTransaction(Wal *pWal){
 ** End a write transaction.  The commit has already been done.  This
 ** routine merely releases the lock.
 */
-int sqlite3WalEndWriteTransaction(Wal *pWal){
+static int sqlite3WalEndWriteTransaction(Wal *pWal){
   if( pWal->writeLock ){
     walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
     pWal->writeLock = 0;
@@ -3347,7 +3353,7 @@ int sqlite3WalEndWriteTransaction(Wal *pWal){
 ** Otherwise, if the callback function does not return an error, this
 ** function returns SQLITE_OK.
 */
-int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
+static int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
   int rc = SQLITE_OK;
   if( ALWAYS(pWal->writeLock) ){
     Pgno iMax = pWal->hdr.mxFrame;
@@ -3387,7 +3393,7 @@ int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
 ** "rollback" the write position of the WAL handle back to the current 
 ** point in the event of a savepoint rollback (via WalSavepointUndo()).
 */
-void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
+static void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
   assert( pWal->writeLock );
   aWalData[0] = pWal->hdr.mxFrame;
   aWalData[1] = pWal->hdr.aFrameCksum[0];
@@ -3401,7 +3407,7 @@ void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
 ** of WAL_SAVEPOINT_NDATA u32 values that has been previously populated
 ** by a call to WalSavepoint().
 */
-int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
+static int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
   int rc = SQLITE_OK;
 
   assert( pWal->writeLock );
@@ -3601,7 +3607,7 @@ static int walRewriteChecksums(Wal *pWal, u32 iLast){
 ** Write a set of frames to the log. The caller must hold the write-lock
 ** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
 */
-int sqlite3WalFrames(
+static int sqlite3WalFrames(
   Wal *pWal,                      /* Wal handle to write to */
   int szPage,                     /* Database page-size in bytes */
   PgHdr *pList,                   /* List of dirty pages to write */
@@ -3710,7 +3716,7 @@ int sqlite3WalFrames(
     ** checksums must be recomputed when the transaction is committed.  */
     if( iFirst && (p->pDirty || isCommit==0) ){
       u32 iWrite = 0;
-      VVA_ONLY(rc =) sqlite3WalFindFrame(pWal, p->pgno, &iWrite);
+      VVA_ONLY(rc =) pWal->pMethods->xFindFrame(pWal, p->pgno, &iWrite);
       assert( rc==SQLITE_OK || iWrite==0 );
       if( iWrite>=iFirst ){
         i64 iOff = walFrameOffset(iWrite, szPage) + WAL_FRAME_HDRSIZE;
@@ -3839,7 +3845,7 @@ int sqlite3WalFrames(
 ** If parameter xBusy is not NULL, it is a pointer to a busy-handler
 ** callback. In this case this function runs a blocking checkpoint.
 */
-int sqlite3WalCheckpoint(
+static int sqlite3WalCheckpoint(
   Wal *pWal,                      /* Wal connection */
   sqlite3 *db,                    /* Check this handle's interrupt flag */
   int eMode,                      /* PASSIVE, FULL, RESTART, or TRUNCATE */
@@ -3868,7 +3874,7 @@ int sqlite3WalCheckpoint(
 
   /* Enable blocking locks, if possible. If blocking locks are successfully
   ** enabled, set xBusy2=0 so that the busy-handler is never invoked. */
-  sqlite3WalDb(pWal, db);
+  pWal->pMethods->xDb(pWal, db);
   (void)walEnableBlocking(pWal);
 
   /* IMPLEMENTATION-OF: R-62028-47212 All calls obtain an exclusive 
@@ -3944,10 +3950,10 @@ int sqlite3WalCheckpoint(
   }
 
   walDisableBlocking(pWal);
-  sqlite3WalDb(pWal, 0);
+  pWal->pMethods->xDb(pWal, 0);
 
   /* Release the locks. */
-  sqlite3WalEndWriteTransaction(pWal);
+  pWal->pMethods->xEndWriteTransaction(pWal);
   if( pWal->ckptLock ){
     walUnlockExclusive(pWal, WAL_CKPT_LOCK, 1);
     pWal->ckptLock = 0;
@@ -3964,7 +3970,7 @@ int sqlite3WalCheckpoint(
 ** sqlite3WalCallback() was called.  If no commits have occurred since
 ** the last call, then return 0.
 */
-int sqlite3WalCallback(Wal *pWal){
+static int sqlite3WalCallback(Wal *pWal){
   u32 ret = 0;
   if( pWal ){
     ret = pWal->iCallback;
@@ -3997,7 +4003,7 @@ int sqlite3WalCallback(Wal *pWal){
 ** should acquire the database exclusive lock prior to invoking
 ** the op==1 case.
 */
-int sqlite3WalExclusiveMode(Wal *pWal, int op){
+static int sqlite3WalExclusiveMode(Wal *pWal, int op){
   int rc;
   assert( pWal->writeLock==0 );
   assert( pWal->exclusiveMode!=WAL_HEAPMEMORY_MODE || op==-1 );
@@ -4039,7 +4045,7 @@ int sqlite3WalExclusiveMode(Wal *pWal, int op){
 ** heap-memory for the wal-index. Otherwise, if the argument is NULL or the
 ** WAL module is using shared-memory, return false. 
 */
-int sqlite3WalHeapMemory(Wal *pWal){
+static int sqlite3WalHeapMemory(Wal *pWal){
   return (pWal && pWal->exclusiveMode==WAL_HEAPMEMORY_MODE );
 }
 
@@ -4048,7 +4054,7 @@ int sqlite3WalHeapMemory(Wal *pWal){
 ** every other subsystem, so the WAL module can put whatever it needs
 ** in the object.
 */
-int sqlite3WalSnapshotGet(Wal *pWal, sqlite3_snapshot **ppSnapshot){
+static int sqlite3WalSnapshotGet(Wal *pWal, sqlite3_snapshot **ppSnapshot){
   int rc = SQLITE_OK;
   WalIndexHdr *pRet;
   static const u32 aZero[4] = { 0, 0, 0, 0 };
@@ -4072,7 +4078,7 @@ int sqlite3WalSnapshotGet(Wal *pWal, sqlite3_snapshot **ppSnapshot){
 
 /* Try to open on pSnapshot when the next read-transaction starts
 */
-void sqlite3WalSnapshotOpen(
+static void sqlite3WalSnapshotOpen(
   Wal *pWal, 
   sqlite3_snapshot *pSnapshot
 ){
@@ -4083,7 +4089,7 @@ void sqlite3WalSnapshotOpen(
 ** Return a +ve value if snapshot p1 is newer than p2. A -ve value if
 ** p1 is older than p2 and zero if p1 and p2 are the same snapshot.
 */
-int sqlite3_snapshot_cmp(sqlite3_snapshot *p1, sqlite3_snapshot *p2){
+static int sqlite3_snapshot_cmp(sqlite3_snapshot *p1, sqlite3_snapshot *p2){
   WalIndexHdr *pHdr1 = (WalIndexHdr*)p1;
   WalIndexHdr *pHdr2 = (WalIndexHdr*)p2;
 
@@ -4107,7 +4113,7 @@ int sqlite3_snapshot_cmp(sqlite3_snapshot *p1, sqlite3_snapshot *p2){
 ** occurs (any value other than SQLITE_OK is returned), the CHECKPOINTER
 ** lock is released before returning.
 */
-int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapshot){
+static int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapshot){
   int rc;
   rc = walLockShared(pWal, WAL_CKPT_LOCK);
   if( rc==SQLITE_OK ){
@@ -4126,7 +4132,7 @@ int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapshot){
 ** Release a lock obtained by an earlier successful call to
 ** sqlite3WalSnapshotCheck().
 */
-void sqlite3WalSnapshotUnlock(Wal *pWal){
+static void sqlite3WalSnapshotUnlock(Wal *pWal){
   assert( pWal );
   walUnlockShared(pWal, WAL_CKPT_LOCK);
 }
@@ -4140,7 +4146,7 @@ void sqlite3WalSnapshotUnlock(Wal *pWal){
 ** read-lock. This function returns the database page-size if it is known,
 ** or zero if it is not (or if pWal is NULL).
 */
-int sqlite3WalFramesize(Wal *pWal){
+static int sqlite3WalFramesize(Wal *pWal){
   assert( pWal==0 || pWal->readLock>=0 );
   return (pWal ? pWal->szPage : 0);
 }
@@ -4148,8 +4154,66 @@ int sqlite3WalFramesize(Wal *pWal){
 
 /* Return the sqlite3_file object for the WAL file
 */
-sqlite3_file *sqlite3WalFile(Wal *pWal){
+static sqlite3_file *sqlite3WalFile(Wal *pWal){
   return pWal->pWalFd;
+}
+
+libsql_wal_methods *libsql_wal_methods_find(const char *zName) {
+  static libsql_wal_methods methods;
+
+  if (!zName || *zName == '\0' || strncmp(zName, "default", 7) == 0) {
+    methods.xOpen = sqlite3WalOpen;
+    methods.xClose = sqlite3WalClose;
+    methods.xLimit = sqlite3WalLimit;
+    methods.xBeginReadTransaction = sqlite3WalBeginReadTransaction;
+    methods.xEndReadTransaction = sqlite3WalEndReadTransaction;
+    methods.xFindFrame = sqlite3WalFindFrame;
+    methods.xReadFrame = sqlite3WalReadFrame;
+    methods.xDbsize = sqlite3WalDbsize;
+    methods.xBeginWriteTransaction = sqlite3WalBeginWriteTransaction;
+    methods.xEndWriteTransaction = sqlite3WalEndWriteTransaction;
+    methods.xUndo = sqlite3WalUndo;
+    methods.xSavepoint = sqlite3WalSavepoint;
+    methods.xSavepointUndo = sqlite3WalSavepointUndo;
+    methods.xFrames = sqlite3WalFrames;
+    methods.xCheckpoint = sqlite3WalCheckpoint;
+    methods.xCallback = sqlite3WalCallback;
+    methods.xExclusiveMode = sqlite3WalExclusiveMode;
+    methods.xHeapMemory = sqlite3WalHeapMemory;
+
+#ifdef SQLITE_ENABLE_SNAPSHOT
+    methods.xSnapshotGet = sqlite3WalSnapshotGet;
+    methods.xSnapshotOpen = sqlite3WalSnapshotOpen;
+    methods.xSnapshotRecover = sqlite3WalSnapshotRecover;
+    methods.xSnapshotCheck = sqlite3WalSnapshotCheck;
+    methods.xSnapshotUnlock = sqlite3WalSnapshotUnlock;
+#endif
+
+#ifdef SQLITE_ENABLE_ZIPVFS
+    methods.xFramesize = sqlite3WalFramesize;
+#endif
+
+    methods.xFile = sqlite3WalFile;
+
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+    methods.xWriteLock = sqlite3WalWriteLock;
+#endif
+    methods.xDb = sqlite3WalDb;
+
+    methods.zName = "default";
+    return &methods;
+  }
+
+  return NULL;
+}
+
+int libsql_wal_methods_register(libsql_wal_methods* pWalMethods, int makeDflt) {
+  // Not implemented yet
+  return SQLITE_MISUSE;
+}
+int libsql_wal_methods_unregister(libsql_wal_methods *pWalMethods) {
+  // Not implemented yet
+  return SQLITE_MISUSE;
 }
 
 #endif /* #ifndef SQLITE_OMIT_WAL */

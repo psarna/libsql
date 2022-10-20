@@ -2906,15 +2906,18 @@ int sqlite3_limit(sqlite3 *db, int limitId, int newLimit){
 */
 int sqlite3ParseUri(
   const char *zDefaultVfs,        /* VFS to use if no "vfs=xxx" query option */
+  const char *zDefaultWal,        /* WAL module to use if no "wal=xxx" query option */
   const char *zUri,               /* Nul-terminated URI to parse */
   unsigned int *pFlags,           /* IN/OUT: SQLITE_OPEN_XXX flags */
   sqlite3_vfs **ppVfs,            /* OUT: VFS to use */ 
+  libsql_wal_methods **ppWal,     /* OUT: WAL module to use */
   char **pzFile,                  /* OUT: Filename component of URI */
   char **pzErrMsg                 /* OUT: Error message (if rc!=SQLITE_OK) */
 ){
   int rc = SQLITE_OK;
   unsigned int flags = *pFlags;
   const char *zVfs = zDefaultVfs;
+  const char *zWal = zDefaultWal;
   char *zFile;
   char c;
   int nUri = sqlite3Strlen30(zUri);
@@ -3045,6 +3048,8 @@ int sqlite3ParseUri(
 
       if( nOpt==3 && memcmp("vfs", zOpt, 3)==0 ){
         zVfs = zVal;
+      }else if( nOpt==3 && memcmp("wal", zOpt, 3)==0 ){
+        zWal = zVal;
       }else{
         struct OpenMode {
           const char *z;
@@ -3127,6 +3132,11 @@ int sqlite3ParseUri(
     *pzErrMsg = sqlite3_mprintf("no such vfs: %s", zVfs);
     rc = SQLITE_ERROR;
   }
+  *ppWal = libsql_wal_methods_find(zWal);
+  if (*ppWal == NULL) {
+    *pzErrMsg = sqlite3_mprintf("no such WAL module: %s", zWal);
+    rc = SQLITE_ERROR;
+  }
  parse_uri_out:
   if( rc!=SQLITE_OK ){
     sqlite3_free_filename(zFile);
@@ -3163,7 +3173,8 @@ static int openDatabase(
   const char *zFilename, /* Database filename UTF-8 encoded */
   sqlite3 **ppDb,        /* OUT: Returned database handle */
   unsigned int flags,    /* Operational flags */
-  const char *zVfs       /* Name of the VFS to use */
+  const char *zVfs,      /* Name of the VFS to use */
+  const char *zWal       /* Name of WAL module to use */
 ){
   sqlite3 *db;                    /* Store allocated handle here */
   int rc;                         /* Return code */
@@ -3387,7 +3398,7 @@ static int openDatabase(
   if( ((1<<(flags&7)) & 0x46)==0 ){
     rc = SQLITE_MISUSE_BKPT;  /* IMP: R-18321-05872 */
   }else{
-    rc = sqlite3ParseUri(zVfs, zFilename, &flags, &db->pVfs, &zOpen, &zErrMsg);
+    rc = sqlite3ParseUri(zVfs, zWal, zFilename, &flags, &db->pVfs, &db->pWalMethods, &zOpen, &zErrMsg);
   }
   if( rc!=SQLITE_OK ){
     if( rc==SQLITE_NOMEM ) sqlite3OomFault(db);
@@ -3397,7 +3408,7 @@ static int openDatabase(
   }
 
   /* Open the backend database driver */
-  rc = sqlite3BtreeOpen(db->pVfs, zOpen, db, &db->aDb[0].pBt, 0,
+  rc = sqlite3BtreeOpen(db->pVfs, db->pWalMethods, zOpen, db, &db->aDb[0].pBt, 0,
                         flags | SQLITE_OPEN_MAIN_DB);
   if( rc!=SQLITE_OK ){
     if( rc==SQLITE_IOERR_NOMEM ){
@@ -3512,7 +3523,7 @@ int sqlite3_open(
   sqlite3 **ppDb 
 ){
   return openDatabase(zFilename, ppDb,
-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL, NULL);
 }
 int sqlite3_open_v2(
   const char *filename,   /* Database filename (UTF-8) */
@@ -3520,7 +3531,17 @@ int sqlite3_open_v2(
   int flags,              /* Flags */
   const char *zVfs        /* Name of VFS module to use */
 ){
-  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs);
+  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, NULL);
+}
+
+int libsql_open(
+  const char *filename,   /* Database filename (UTF-8) */
+  sqlite3 **ppDb,         /* OUT: SQLite db handle */
+  int flags,              /* Flags */
+  const char *zVfs,       /* Name of VFS module to use, NULL for default */
+  const char *zWal        /* Name of WAL module to use */
+) {
+  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, zWal);
 }
 
 #ifndef SQLITE_OMIT_UTF16
@@ -3549,7 +3570,7 @@ int sqlite3_open16(
   zFilename8 = sqlite3ValueText(pVal, SQLITE_UTF8);
   if( zFilename8 ){
     rc = openDatabase(zFilename8, ppDb,
-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL, NULL);
     assert( *ppDb || rc==SQLITE_NOMEM );
     if( rc==SQLITE_OK && !DbHasProperty(*ppDb, 0, DB_SchemaLoaded) ){
       SCHEMA_ENC(*ppDb) = ENC(*ppDb) = SQLITE_UTF16NATIVE;
