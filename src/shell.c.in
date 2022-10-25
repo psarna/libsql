@@ -5024,6 +5024,8 @@ static void shellEscapeCrnl(
   sqlite3_result_value(context, argv[0]);
 }
 
+extern void libsql_register_vwal();
+
 /* Flags for open_db().
 **
 ** The default behavior of open_db() is to exit(1) if the database fails to
@@ -5074,8 +5076,9 @@ static void open_db(ShellState *p, int openFlags){
       }
       case SHELL_OPEN_UNSPEC:
       case SHELL_OPEN_NORMAL: {
-        sqlite3_open_v2(zDbFilename, &p->db,
-           SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|p->openFlags, 0);
+        libsql_register_vwal();
+        libsql_open(zDbFilename, &p->db,
+           SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|p->openFlags, NULL, "vwal");
         break;
       }
     }
