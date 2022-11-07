@@ -22,9 +22,7 @@
 #endif
 #include "vdbeInt.h"
 #ifdef LIBSQL_ENABLE_WASM_RUNTIME
-#include <wasm.h>
-#include <wasmtime.h>
-#include <wasmtime/error.h>
+#include "ext/udf/wasm_bindings.h"
 #endif
 
 /*
@@ -2215,12 +2213,12 @@ static void signFunc(
 }
 
 #ifdef LIBSQL_ENABLE_WASM_RUNTIME
-static int maybe_handle_wasm_error(sqlite3_context *context, wasmtime_error_t *error) {
+static int maybe_handle_wasm_error(sqlite3_context *context, libsql_wasm_error_t *error) {
   if (error) {
-    wasm_name_t message;
-    wasmtime_error_message(error, &message);
+    libsql_wasm_byte_vec_t message;
+    libsql_wasm_error_message(error, &message);
     sqlite3_result_error(context, message.data, -1);
-    wasm_byte_vec_delete(&message);
+    libsql_wasm_byte_vec_delete(&message);
     return 1;
   }
   return 0;
@@ -2229,54 +2227,54 @@ static int maybe_handle_wasm_error(sqlite3_context *context, wasmtime_error_t *e
 void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
   void *user_data = sqlite3_user_data(context);
 
-  wasmtime_module_t *module = *(wasmtime_module_t **)(user_data);
+  libsql_wasm_module_t *module = *(libsql_wasm_module_t **)(user_data);
   const char *func_name = (const char *)user_data + sizeof(module);
 
-  wasm_engine_t *engine = context->pVdbe->db->wasm.engine;
+  libsql_wasm_engine_t *engine = context->pVdbe->db->wasm.engine;
   assert(engine);
-  wasmtime_store_t *store = wasmtime_store_new(engine, NULL, NULL);
-  wasmtime_context_t *wasm_ctx = wasmtime_store_context(store);
+  libsql_wasm_store_t *store = libsql_wasm_store_new(engine, NULL, NULL);
+  libsql_wasm_context_t *wasm_ctx = libsql_wasm_store_context(store);
 
-  wasm_trap_t *trap = NULL;
-  wasmtime_instance_t instance;
-  wasmtime_error_t *error = wasmtime_instance_new(wasm_ctx, module, NULL, 0, &instance, &trap);
+  libsql_wasm_trap_t *trap = NULL;
+  libsql_wasm_instance_t instance;
+  libsql_wasm_error_t *error = libsql_wasm_instance_new(wasm_ctx, module, NULL, 0, &instance, &trap);
   if (maybe_handle_wasm_error(context, error)) {
     return;
   }
 
   // Look up the target function
-  wasmtime_extern_t func;
-  bool ok = wasmtime_instance_export_get(wasm_ctx, &instance, func_name, strlen(func_name), &func);
+  libsql_wasm_extern_t func;
+  int ok = libsql_wasm_instance_export_get(wasm_ctx, &instance, func_name, strlen(func_name), &func);
   if (!ok) {
     sqlite3_result_error(context, "Failed to extract function from the Wasm module", -1);
     return;
   }
-  if (func.kind != WASMTIME_EXTERN_FUNC) {
+  if (func.kind != LIBSQL_WASM_EXTERN_FUNC) {
     sqlite3_result_error(context, "Found exported symbol, but it's not a function", -1);
     return;
   }
 
-  wasmtime_extern_t item;
-  ok = wasmtime_instance_export_get(wasm_ctx, &instance, "memory", 6, &item);
-  if (!ok || item.kind != WASMTIME_EXTERN_MEMORY) {
+  libsql_wasm_extern_t item;
+  ok = libsql_wasm_instance_export_get(wasm_ctx, &instance, "memory", 6, &item);
+  if (!ok || item.kind != LIBSQL_WASM_EXTERN_MEMORY) {
     sqlite3_result_error(context, "Failed to extract memory from the Wasm module", -1);
     return;
   }
-  wasmtime_memory_t *mem = &item.of.memory;
-  size_t mem_size = wasmtime_memory_data_size(wasm_ctx, mem);
+  libsql_wasm_memory_t *mem = &item.of.memory;
+  size_t mem_size = libsql_wasm_memory_data_size(wasm_ctx, mem);
   size_t mem_offset = mem_size; // next free offset to write at
-  char *mem_base = (char *)wasmtime_memory_data(wasm_ctx, mem);
+  char *mem_base = (char *)libsql_wasm_memory_data(wasm_ctx, mem);
 
-  wasmtime_val_t params[argc];
+  libsql_wasm_val_t params[argc];
   for (unsigned i = 0; i < argc; ++i) {
     u8 type = sqlite3_value_type(argv[i]);
     switch (type) {
     case SQLITE_INTEGER:
-      params[i].kind = WASMTIME_I64;
+      params[i].kind = LIBSQL_WASM_I64;
       params[i].of.i64 = sqlite3_value_int(argv[i]);
       break;
     case SQLITE_FLOAT:
-      params[i].kind = WASMTIME_F64;
+      params[i].kind = LIBSQL_WASM_F64;
       params[i].of.f64 = sqlite3_value_double(argv[i]);
       break;
     case SQLITE_BLOB: {
@@ -2285,11 +2283,11 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
 
       if (mem_offset + blob_len + 1 + 4 > mem_size) {
         int delta = (blob_len + 1 + 4 + 65535) / 65536;
-        error = wasmtime_memory_grow(wasm_ctx, mem, delta, &mem_size);
+        error = libsql_wasm_memory_grow(wasm_ctx, mem, delta, &mem_size);
         if (maybe_handle_wasm_error(context, error)) {
           return;
         }
-        mem_base = wasmtime_memory_data(wasm_ctx, mem);
+        mem_base = libsql_wasm_memory_data(wasm_ctx, mem);
         mem_size += delta * 65536;
       }
       // blob is encoded as: [1 byte of type information][4 bytes of size, big endian][data]
@@ -2297,7 +2295,7 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
       sqlite3Put4byte(mem_base + mem_offset + 1, blob_len);
       memcpy(mem_base + mem_offset + 1 + 4, blob, blob_len);
 
-      params[i].kind = WASMTIME_I32; // pointer
+      params[i].kind = LIBSQL_WASM_I32; // pointer
       params[i].of.i32 = mem_offset;
 
       mem_offset += blob_len + 4 + 1;
@@ -2309,11 +2307,11 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
 
       if (mem_offset + text_len + 1 > mem_size) {
         int delta = (text_len + 1 + 65535) / 65536;
-        error = wasmtime_memory_grow(wasm_ctx, mem, delta, &mem_size);
+        error = libsql_wasm_memory_grow(wasm_ctx, mem, delta, &mem_size);
         if (maybe_handle_wasm_error(context, error)) {
           return;
         }
-        mem_base = wasmtime_memory_data(wasm_ctx, mem);
+        mem_base = libsql_wasm_memory_data(wasm_ctx, mem);
         mem_size += delta * 65536;
       }
       // text is encoded as: [1 byte of type information][data][null terminator]
@@ -2321,7 +2319,7 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
       memcpy(mem_base + mem_offset + 1, text, text_len);
       mem_base[mem_offset + 1 + text_len] = '\0';
 
-      params[i].kind = WASMTIME_I32; // pointer
+      params[i].kind = LIBSQL_WASM_I32; // pointer
       params[i].of.i32 = mem_offset;
 
       mem_offset += text_len + 2;
@@ -2329,17 +2327,17 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
     }
     case SQLITE_NULL:
       if (mem_offset + 1 > mem_size) {
-        error = wasmtime_memory_grow(wasm_ctx, mem, 1, &mem_size);
+        error = libsql_wasm_memory_grow(wasm_ctx, mem, 1, &mem_size);
         if (maybe_handle_wasm_error(context, error)) {
           return;
         }
-        mem_base = wasmtime_memory_data(wasm_ctx, mem);
+        mem_base = libsql_wasm_memory_data(wasm_ctx, mem);
         mem_size += 65536;
       }
       // null is encoded as: [1 byte of type information]
       mem_base[mem_offset] = type;
 
-      params[i].kind = WASMTIME_I32; // pointer
+      params[i].kind = LIBSQL_WASM_I32; // pointer
       params[i].of.i32 = mem_offset;
 
       mem_offset++;
@@ -2347,19 +2345,19 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
     }
   }
 
-  wasmtime_val_t results[1];
-  error = wasmtime_func_call(wasm_ctx, &func.of.func, params, argc, results, 1, &trap);
+  libsql_wasm_val_t results[1];
+  error = libsql_wasm_func_call(wasm_ctx, &func.of.func, params, argc, results, 1, &trap);
   if (maybe_handle_wasm_error(context, error)) {
     return;
   }
   switch (results[0].kind) {
-  case WASMTIME_I64:
+  case LIBSQL_WASM_I64:
     sqlite3_result_int(context, results[0].of.i64);
     break;
-  case WASMTIME_F64:
+  case LIBSQL_WASM_F64:
     sqlite3_result_double(context, results[0].of.f64);
     break;
-  case WASMTIME_I32: {
+  case LIBSQL_WASM_I32: {
     char type = mem_base[results[0].of.i32];
     switch (type) {
     case SQLITE_TEXT: {
@@ -2405,20 +2403,20 @@ void run_wasm(sqlite3_context *context, int argc, sqlite3_value **argv) {
 }
 
 static void free_wasm_module(void *module) {
-  wasmtime_module_delete(*(wasmtime_module_t **)module);
+  libsql_wasm_module_delete(*(libsql_wasm_module_t **)module);
 }
 
 // Tries to initialize and register a Wasm function dynamically.
 // Returns NULL on failure and fills err_msg_buf with an error message, if not NULL.
-FuncDef *try_instantiate_wasm_function(sqlite3 *db, const char *pName, int nName, const char *pSrcBody, int nBody, int nArg, wasm_byte_vec_t *err_msg_buf) {
+FuncDef *try_instantiate_wasm_function(sqlite3 *db, const char *pName, int nName, const char *pSrcBody, int nBody, int nArg, libsql_wasm_byte_vec_t *err_msg_buf) {
   FuncDef *pBest = NULL;
   FuncDef *pOther = NULL;
 
   if (!db->wasm.engine) {
-    db->wasm.engine = wasm_engine_new();
+    db->wasm.engine = libsql_wasm_engine_new();
   }
-  wasm_byte_vec_t compiled_wasm;
-  wasmtime_error_t *error = NULL;
+  libsql_wasm_byte_vec_t compiled_wasm;
+  libsql_wasm_error_t *error = NULL;
 
   int source_already_compiled = (nBody >= 4
                                  && pSrcBody[0] == '\0'
@@ -2429,29 +2427,29 @@ FuncDef *try_instantiate_wasm_function(sqlite3 *db, const char *pName, int nName
     compiled_wasm.data = (char *)pSrcBody;
     compiled_wasm.size = nBody;
   } else {
-    error = wasmtime_wat2wasm(pSrcBody, nBody, &compiled_wasm);
+    error = libsql_wasm_wat2wasm(pSrcBody, nBody, &compiled_wasm);
     if (error) {
       char *zEscapedBody = sqlite3DbStrNDup(db, pSrcBody, nBody);
       sqlite3Dequote(zEscapedBody);
-      error = wasmtime_wat2wasm(zEscapedBody, sqlite3Strlen30(zEscapedBody), &compiled_wasm);
+      error = libsql_wasm_wat2wasm(zEscapedBody, sqlite3Strlen30(zEscapedBody), &compiled_wasm);
       sqlite3DbFree(db, zEscapedBody);
       if (error) {
         if (err_msg_buf) {
-          wasmtime_error_message(error, err_msg_buf);
+          libsql_wasm_error_message(error, err_msg_buf);
         }
         return NULL;
       }
     }
   }
 
-  wasmtime_module_t *module = NULL;
-  error = wasmtime_module_new(db->wasm.engine, (uint8_t *)compiled_wasm.data, compiled_wasm.size, &module);
+  libsql_wasm_module_t *module = NULL;
+  error = libsql_wasm_module_new(db->wasm.engine, (uint8_t *)compiled_wasm.data, compiled_wasm.size, &module);
   if (!source_already_compiled) {
-    wasm_byte_vec_delete(&compiled_wasm);
+    libsql_wasm_byte_vec_delete(&compiled_wasm);
   }
   if (error) {
     if (err_msg_buf) {
-      wasmtime_error_message(error, err_msg_buf);
+      libsql_wasm_error_message(error, err_msg_buf);
     }
     return NULL;
   }
