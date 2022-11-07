@@ -20,6 +20,9 @@
 */
 #include "sqliteInt.h"
 #include "vdbeInt.h"
+#ifdef LIBSQL_ENABLE_WASM_RUNTIME
+#include "ext/udf/wasm_bindings.h"
+#endif
 
 /*
 ** Invoke this macro on memory cells just prior to changing the
@@ -707,11 +710,6 @@ static const char *vdbeMemTypeName(Mem *pMem){
   };
   return azTypes[sqlite3_value_type(pMem)-1];
 }
-
-#ifdef LIBSQL_ENABLE_WASM_RUNTIME
-FuncDef *try_instantiate_wasm_function(sqlite3 *db, const char *pName, int nName, const char *pSrcBody, int nBody, int nArg, wasm_byte_vec_t *err_msg_buf);
-int deregister_wasm_function(sqlite3 *db, const char *zName);
-#endif
 
 /*
 ** Execute as much of a VDBE program as we can.
@@ -5354,12 +5352,12 @@ case OP_Sequence: {           /* out2 */
 ** the name's null terminator. P1 means that IF NOT EXISTS was passed.
 */
 case OP_CreateWasmFunc: {
-  wasm_byte_vec_t err_msg = { .data = NULL, .size = 0 };
-  FuncDef *def = try_instantiate_wasm_function(db, pOp->p4.z, pOp->p2, pOp->p4.z + pOp->p2 + 1, pOp->p3, -1, &err_msg);
+  char *err_buf;
+  FuncDef *def = try_instantiate_wasm_function(db, pOp->p4.z, pOp->p2, pOp->p4.z + pOp->p2 + 1, pOp->p3, -1, &err_buf);
   if( pOp->p1 == 0 && !def ) {
     sqlite3DbFree(db, p->zErrMsg);
-    p->zErrMsg = sqlite3MPrintf(db, "Registering Wasm function %s failed: %s", pOp->p4.z, err_msg.data);
-    wasm_byte_vec_delete(&err_msg);
+    p->zErrMsg = sqlite3MPrintf(db, "Registering Wasm function %s failed: %s", pOp->p4.z, err_buf);
+    sqlite3DbFree(db, err_buf);
     rc = SQLITE_ERROR;
     goto abort_due_to_error;
   }
