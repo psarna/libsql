@@ -1,0 +1,16 @@
+[package]
+name = "libsql-wasmtime-bindings"
+version = "0.0.1"
+description = "Wasmtime C API exposed for libSQL"
+license = "MIT"
+publish = false
+
+[dependencies]
+wasmtime-c-api = { git = "https://github.com/psarna/wasmtime", branch = "main", version = "4.0" }
+
+[lib]
+name = "libsqlwasmtimebindings"
+crate-type = ["staticlib", "cdylib", "lib"]
+doc = false
+test = false
+doctest = false
