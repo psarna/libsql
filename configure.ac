@@ -636,7 +636,6 @@ AC_MSG_CHECKING([whether to support WebAssembly integration])
 if test "$enable_wasm_runtime" = "yes"; then
   AC_MSG_RESULT([yes])
   OPT_FEATURE_FLAGS="${OPT_FEATURE_FLAGS} -DLIBSQL_ENABLE_WASM_RUNTIME"
-  AC_SEARCH_LIBS(wasmtime_store_new, wasmtime)
 else
   AC_MSG_RESULT([no])
 fi

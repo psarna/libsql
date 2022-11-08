@@ -11689,7 +11689,7 @@ fi
 
 	if test x"$found" = xno; then
 		if test x"$enable_readline" = xyes; then
-			as_fn_error 1 "No suitable readline library found"
+			as_fn_error $? "\"No suitable readline library found\"" "$LINENO" 5
 		fi
 		TARGET_READLINE_LIBS=""
 		TARGET_READLINE_INC=""
@@ -12063,65 +12063,6 @@ if test "$enable_wasm_runtime" = "yes"; then
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
 printf "%s\n" "yes" >&6; }
   OPT_FEATURE_FLAGS="${OPT_FEATURE_FLAGS} -DLIBSQL_ENABLE_WASM_RUNTIME"
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for library containing wasmtime_store_new" >&5
-printf %s "checking for library containing wasmtime_store_new... " >&6; }
-if test ${ac_cv_search_wasmtime_store_new+y}
-then :
-  printf %s "(cached) " >&6
-else $as_nop
-  ac_func_search_save_LIBS=$LIBS
-cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-/* Override any GCC internal prototype to avoid an error.
-   Use char because int might match the return type of a GCC
-   builtin and then its argument prototype would still apply.  */
-char wasmtime_store_new ();
-int
-main (void)
-{
-return wasmtime_store_new ();
-  ;
-  return 0;
-}
-_ACEOF
-for ac_lib in '' wasmtime
-do
-  if test -z "$ac_lib"; then
-    ac_res="none required"
-  else
-    ac_res=-l$ac_lib
-    LIBS="-l$ac_lib  $ac_func_search_save_LIBS"
-  fi
-  if ac_fn_c_try_link "$LINENO"
-then :
-  ac_cv_search_wasmtime_store_new=$ac_res
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam \
-    conftest$ac_exeext
-  if test ${ac_cv_search_wasmtime_store_new+y}
-then :
-  break
-fi
-done
-if test ${ac_cv_search_wasmtime_store_new+y}
-then :
-
-else $as_nop
-  ac_cv_search_wasmtime_store_new=no
-fi
-rm conftest.$ac_ext
-LIBS=$ac_func_search_save_LIBS
-fi
-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_search_wasmtime_store_new" >&5
-printf "%s\n" "$ac_cv_search_wasmtime_store_new" >&6; }
-ac_res=$ac_cv_search_wasmtime_store_new
-if test "$ac_res" != no
-then :
-  test "$ac_res" = "none required" || LIBS="$ac_res $LIBS"
-
-fi
-
 else
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
 printf "%s\n" "no" >&6; }
