@@ -634,17 +634,25 @@ AC_ARG_ENABLE(wasm_runtime,
 AS_HELP_STRING([--enable-wasm-runtime],[Enable WebAssembly runtime integration]))
 AC_ARG_ENABLE(wasm_runtime_dynamic, 
 AS_HELP_STRING([--enable-wasm-runtime-dynamic],[Enable WebAssembly runtime integration (dynamic linking)]))
+AC_ARG_ENABLE(wasm_runtime_wasmedge, 
+AS_HELP_STRING([--enable-wasm-runtime-wasmedge],[Enable WebAssembly runtime integration (WasmEdge library)]))
 AC_MSG_CHECKING([whether to support WebAssembly integration])
-if test "$enable_wasm_runtime" = "yes" -o "$enable_wasm_runtime_dynamic" = "yes"; then
+if test "$enable_wasm_runtime" = "yes" \
+    -o "$enable_wasm_runtime_dynamic" = "yes" \
+    -o "$enable_wasm_runtime_wasmedge" = "yes"; then
   AC_MSG_RESULT([yes])
   OPT_FEATURE_FLAGS="${OPT_FEATURE_FLAGS} -DLIBSQL_ENABLE_WASM_RUNTIME"
   AC_CHECK_PROG(CARGO_BIN, cargo)
   if test "$enable_wasm_runtime" = "yes"; then
     TARGET_OPT_WASM_RUNTIME_LINK='$(TOP)/.libs/libwblibsql.a'
     OPT_WASM_RUNTIME_LIB="libwblibsql.a"
-  else
+  elif test "$enable_wasm_runtime_dynamic" = "yes"; then
     TARGET_OPT_WASM_RUNTIME_LINK='-L$(TOP)/.libs/ -lwblibsql'
     OPT_WASM_RUNTIME_LIB="libwblibsql.so"
+  elif test "$enable_wasm_runtime_wasmedge" = "yes"; then
+    OPT_FEATURE_FLAGS="${OPT_FEATURE_FLAGS} -DLIBSQL_ENABLE_WASM_RUNTIME_WASMEDGE"
+    TARGET_OPT_WASM_RUNTIME_LINK='-lwasmedge'
+    OPT_WASM_RUNTIME_LIB=""
   fi
 else
   TARGET_OPT_WASM_RUNTIME_LINK=""
