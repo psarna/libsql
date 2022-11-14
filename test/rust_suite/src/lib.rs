@@ -1,4 +1,5 @@
 mod random_rowid;
+mod virtual_wal;
 
 #[cfg(test)]
 mod tests {
