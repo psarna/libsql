@@ -3603,6 +3603,7 @@ case OP_Count: {         /* out2 */
   }else{
     nEntry = 0;  /* Not needed.  Only used to silence a warning. */
     rc = sqlite3BtreeCount(db, pCrsr, &nEntry);
+    p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_READ - LIBSQL_STMTSTATUS_BASE] += nEntry;
     if( rc ) goto abort_due_to_error;
   }
   pOut = out2Prerelease(p, pOp);
@@ -4762,6 +4763,7 @@ case OP_SeekGT: {       /* jump, in3, group, ncycle */
       goto seek_not_found;
     }
   }
+  p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_READ - LIBSQL_STMTSTATUS_BASE]++;
 #ifdef SQLITE_TEST
   sqlite3_search_count++;
 #endif
@@ -5331,6 +5333,7 @@ notExistsWithKey:
   VdbeBranchTaken(res!=0,2);
   pC->seekResult = res;
   if( res!=0 ){
+    p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_READ - LIBSQL_STMTSTATUS_BASE]++;
     assert( rc==SQLITE_OK );
     if( pOp->p2==0 ){
       rc = SQLITE_CORRUPT_BKPT;
@@ -6213,6 +6216,7 @@ case OP_Rewind: {        /* jump, ncycle */
   }
   if( rc ) goto abort_due_to_error;
   pC->nullRow = (u8)res;
+  p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_READ - LIBSQL_STMTSTATUS_BASE]++;
   if( pOp->p2>0 ){
     VdbeBranchTaken(res!=0,2);
     if( res ) goto jump_to_p2;
@@ -6318,6 +6322,7 @@ next_tail:
   if( rc==SQLITE_OK ){
     pC->nullRow = 0;
     p->aCounter[pOp->p5]++;
+    p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_READ - LIBSQL_STMTSTATUS_BASE]++;
 #ifdef SQLITE_TEST
     sqlite3_search_count++;
 #endif
