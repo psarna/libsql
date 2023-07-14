@@ -14,6 +14,13 @@ pub use replica::snapshot::TempSnapshot;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
+pub mod rpc {
+    #![allow(clippy::all)]
+    tonic::include_proto!("wal_log");
+
+    pub use tonic::transport::Endpoint;
+    pub type Client = replication_log_client::ReplicationLogClient<tonic::transport::Channel>;
+}
 pub struct Replicator {
     pub frames_sender: Sender<Frames>,
     pub current_frame_no_notifier: tokio::sync::watch::Receiver<FrameNo>,
@@ -145,6 +152,87 @@ impl Replicator {
         }
         let _ = self.frames_sender.blocking_send(frames);
         self.injector.step()?;
+        Ok(())
+    }
+
+    pub async fn connect_to_rpc(
+        addr: impl Into<tonic::transport::Endpoint>,
+    ) -> anyhow::Result<(rpc::Client, replica::meta::WalIndexMeta)> {
+        let mut client = rpc::Client::connect(addr).await?;
+        let response = client.hello(rpc::HelloRequest {}).await?.into_inner();
+        // FIXME: not that simple, we need to figure out if we always start from frame 1?
+        let meta = replica::meta::WalIndexMeta {
+            pre_commit_frame_no: 0,
+            post_commit_frame_no: 0,
+            generation_id: response.generation_id.parse::<uuid::Uuid>()?.to_u128_le(),
+            database_id: response.database_id.parse::<uuid::Uuid>()?.to_u128_le(),
+        };
+        tracing::debug!("Hello response: {response:?}");
+        Ok((client, meta))
+    }
+
+    pub async fn sync_from_rpc(&mut self, client: &mut rpc::Client, frames_count: usize) -> anyhow::Result<()> {
+        use futures::StreamExt;
+        const MAX_REPLICA_REPLICATION_BUFFER_LEN: usize = 10_000_000 / 4096; // ~10MB
+
+        // FIXME: sqld code uses the frame_no_notifier here - investigate if so should we
+        let next_offset = self.meta.lock().unwrap().pre_commit_frame_no;
+        let mut log_entries = client
+            .log_entries(rpc::LogOffset { next_offset })
+            .await?
+            .into_inner();
+
+        let mut buffer = Vec::new();
+        for _ in 0..frames_count {
+            match log_entries.next().await {
+                Some(Ok(frame)) => {
+                    let frame = Frame::try_from_bytes(frame.data)?;
+                    tracing::info!("Got {frame:?}");
+                    buffer.push(frame.clone());
+                    if frame.header().size_after != 0
+                        || buffer.len() > MAX_REPLICA_REPLICATION_BUFFER_LEN
+                    {
+                        let _ = self
+                            .frames_sender
+                            .send(Frames::Vec(std::mem::take(&mut buffer)))
+                            .await;
+                    }
+                }
+                Some(Err(err))
+                    if err.code() == tonic::Code::FailedPrecondition
+                        && err.message() == "NEED_SNAPSHOT" =>
+                {
+                    tracing::info!("loading snapshot");
+                    // remove any outstanding frames in the buffer that are not part of a
+                    // transaction: they are now part of the snapshot.
+                    buffer.clear();
+                    self.sync_from_snapshot(client).await?;
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_from_snapshot(&mut self, client: &mut rpc::Client) -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let next_offset = self.meta.lock().unwrap().pre_commit_frame_no;
+        let frames = client
+            .snapshot(rpc::LogOffset { next_offset })
+            .await?
+            .into_inner();
+
+        let stream = frames.map(|data| match data {
+            Ok(frame) => Frame::try_from_bytes(frame.data),
+            Err(e) => anyhow::bail!(e),
+        });
+        // FIXME: do not hardcode the temporary path for downloading snapshots
+        let snap = TempSnapshot::from_stream("data.sqld".as_ref(), stream).await?;
+
+        let _ = self.frames_sender.send(Frames::Snapshot(snap)).await;
+
         Ok(())
     }
 }
