@@ -13,12 +13,7 @@ async fn main() {
 
     let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
     loop {
-        if let Err(e) = tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || db.lock().sync()
-        })
-        .await
-        {
+        if let Err(e) = db.lock().sync().await {
             println!("Error: {e}");
             break;
         };

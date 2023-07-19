@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-
 use crate::{connection::Connection, errors::Error::ConnectionFailed, Result};
 #[cfg(feature = "replication")]
 use libsql_replication::Replicator;
@@ -8,8 +6,8 @@ pub use libsql_replication::{rpc, Client, Frames, TempSnapshot};
 
 #[cfg(feature = "replication")]
 pub struct ReplicationContext {
-    pub replicator: RefCell<Replicator>,
-    pub client: Option<RefCell<Client>>,
+    pub replicator: Replicator,
+    pub client: Option<Client>,
 }
 
 #[cfg(feature = "replication")]
@@ -70,11 +68,10 @@ impl Database {
                 .await
                 .map_err(|e| ConnectionFailed(format!("{e}")))?;
                 *replicator.meta.lock() = Some(meta);
-                Some(RefCell::new(client))
+                Some(client)
             }
             Sync::Frame => None,
         };
-        let replicator = RefCell::new(replicator);
         db.replication_ctx = Some(ReplicationContext { replicator, client });
         Ok(db)
     }
@@ -94,13 +91,11 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    pub async fn sync(&self) -> Result<()> {
-        if let Some(ctx) = self.replication_ctx.as_ref() {
-            if let Some(client) = ctx.client.as_ref() {
-                let mut client = client.borrow_mut();
-                let mut replicator = ctx.replicator.borrow_mut();
-                replicator
-                    .sync_from_rpc(&mut client)
+    pub async fn sync(&mut self) -> Result<()> {
+        if let Some(ctx) = &mut self.replication_ctx {
+            if let Some(client) = &mut ctx.client {
+                ctx.replicator
+                    .sync_from_rpc(client)
                     .await
                     .map_err(|e| ConnectionFailed(format!("{e}")))
             } else {
@@ -115,10 +110,9 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    pub fn sync_frames(&self, frames: Frames) -> Result<()> {
-        if let Some(ctx) = self.replication_ctx.as_ref() {
-            let mut replicator = ctx.replicator.borrow_mut();
-            replicator
+    pub fn sync_frames(&mut self, frames: Frames) -> Result<()> {
+        if let Some(ctx) = &mut self.replication_ctx {
+            ctx.replicator
                 .sync(frames)
                 .map_err(|e| ConnectionFailed(format!("{e}")))
         } else {
