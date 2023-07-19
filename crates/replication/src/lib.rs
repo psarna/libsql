@@ -10,6 +10,7 @@ pub use frame::{Frame, FrameHeader};
 pub use replica::hook::{Frames, InjectorHookCtx};
 use replica::snapshot::SnapshotFileHeader;
 pub use replica::snapshot::TempSnapshot;
+use futures::stream::Peekable;
 
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -33,7 +34,7 @@ pub struct Replicator {
 
 pub struct Client {
     pub inner: rpc::Client,
-    pub stream: Option<tonic::Streaming<rpc::Frame>>,
+    pub stream: Option<Peekable<tonic::Streaming<rpc::Frame>>>,
 }
 
 impl Replicator {
@@ -186,60 +187,66 @@ impl Replicator {
         const MAX_REPLICA_REPLICATION_BUFFER_LEN: usize = 10_000_000 / 4096; // ~10MB
         tracing::trace!("Syncing frames from RPC");
         // Reuse the stream if it exists, otherwise create a new one
-        let stream = match &mut client.stream {
-            Some(stream) => stream,
-            None => {
-                tracing::trace!("Creating new stream");
-                // FIXME: sqld code uses the frame_no_notifier here - investigate if so should we
-                let next_offset = self.meta.lock().unwrap().pre_commit_frame_no;
-                client.stream = Some(
-                    client
-                        .inner
-                        .log_entries(rpc::LogOffset { next_offset })
-                        .await?
-                        .into_inner(),
-                );
-                client.stream.as_mut().unwrap()
-            }
-        };
-
         let mut buffer = Vec::new();
         loop {
-            match stream.next().await {
-                Some(Ok(frame)) => {
-                    let frame = Frame::try_from_bytes(frame.data)?;
-                    tracing::trace!(
-                        "Received frame {frame:?}, buffer has {} frames, size_after={}",
-                        buffer.len(),
-                        frame.header().size_after
+            let stream = match &mut client.stream {
+                Some(stream) => stream,
+                None => {
+                    tracing::trace!("Creating new stream");
+                    // FIXME: sqld code uses the frame_no_notifier here - investigate if so should we
+                    let next_offset = self.meta.lock().unwrap().pre_commit_frame_no;
+                    client.stream = Some(
+                        client
+                            .inner
+                            .log_entries(rpc::LogOffset { next_offset })
+                            .await?
+                            .into_inner()
+                            .peekable(),
                     );
-                    buffer.push(frame.clone());
-                    if frame.header().size_after != 0
-                        || buffer.len() > MAX_REPLICA_REPLICATION_BUFFER_LEN
-                    {
-                        tracing::trace!("Sending {} frames to the injector", buffer.len());
-                        let _ = self
-                            .frames_sender
-                            .send(Frames::Vec(std::mem::take(&mut buffer)))
-                            .await;
-                        // Let's return here to indicate that we made progress.
-                        // There may be more data in the stream and it's fine, the user would just ask to sync again.
-                        return Ok(frame.header().size_after != 0);
+                    client.stream.as_mut().unwrap()
+                }
+            };
+
+            // If nothing can be immediately read from the stream, continue
+            match std::pin::Pin::new(stream).peek_mut().await {
+                Some(frame) => {
+                    match frame {
+                        Ok(frame) => {
+                            let frame = Frame::try_from_bytes(std::mem::take(&mut frame.data))?;
+                            tracing::trace!(
+                                "Received frame {frame:?}, buffer has {} frames, size_after={}",
+                                buffer.len(),
+                                frame.header().size_after
+                            );
+                            buffer.push(frame.clone());
+                            if frame.header().size_after != 0
+                                || buffer.len() > MAX_REPLICA_REPLICATION_BUFFER_LEN
+                            {
+                                tracing::trace!("Sending {} frames to the injector", buffer.len());
+                                let _ = self
+                                    .frames_sender
+                                    .send(Frames::Vec(std::mem::take(&mut buffer)))
+                                    .await;
+                                // Let's return here to indicate that we made progress.
+                                // There may be more data in the stream and it's fine, the user would just ask to sync again.
+                                return Ok(frame.header().size_after != 0);
+                            }
+                        }
+                        Err(err)
+                            if err.code() == tonic::Code::FailedPrecondition
+                                && err.message() == "NEED_SNAPSHOT" =>
+                        {
+                            tracing::info!("loading snapshot");
+                            // remove any outstanding frames in the buffer that are not part of a
+                            // transaction: they are now part of the snapshot.
+                            buffer.clear();
+                            let _ = stream;
+                            self.sync_from_snapshot(client).await?;
+                            return Ok(true);
+                        }
+                        Err(e) => return Err((*e).clone().into()),
                     }
                 }
-                Some(Err(err))
-                    if err.code() == tonic::Code::FailedPrecondition
-                        && err.message() == "NEED_SNAPSHOT" =>
-                {
-                    tracing::info!("loading snapshot");
-                    // remove any outstanding frames in the buffer that are not part of a
-                    // transaction: they are now part of the snapshot.
-                    buffer.clear();
-                    let _ = stream;
-                    self.sync_from_snapshot(client).await?;
-                    return Ok(true);
-                }
-                Some(Err(e)) => return Err(e.into()),
                 None => return Ok(true),
             }
         }
