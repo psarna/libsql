@@ -207,46 +207,47 @@ impl Replicator {
                 }
             };
 
-            // If nothing can be immediately read from the stream, continue
-            match std::pin::Pin::new(stream).peek_mut().await {
-                Some(frame) => {
-                    match frame {
-                        Ok(frame) => {
-                            let frame = Frame::try_from_bytes(std::mem::take(&mut frame.data))?;
-                            tracing::trace!(
-                                "Received frame {frame:?}, buffer has {} frames, size_after={}",
-                                buffer.len(),
-                                frame.header().size_after
-                            );
-                            buffer.push(frame.clone());
-                            if frame.header().size_after != 0
-                                || buffer.len() > MAX_REPLICA_REPLICATION_BUFFER_LEN
-                            {
-                                tracing::trace!("Sending {} frames to the injector", buffer.len());
-                                let _ = self
-                                    .frames_sender
-                                    .send(Frames::Vec(std::mem::take(&mut buffer)))
-                                    .await;
-                                // Let's return here to indicate that we made progress.
-                                // There may be more data in the stream and it's fine, the user would just ask to sync again.
-                                return Ok(frame.header().size_after != 0);
-                            }
-                        }
-                        Err(err)
-                            if err.code() == tonic::Code::FailedPrecondition
-                                && err.message() == "NEED_SNAPSHOT" =>
-                        {
-                            tracing::info!("loading snapshot");
-                            // remove any outstanding frames in the buffer that are not part of a
-                            // transaction: they are now part of the snapshot.
-                            buffer.clear();
-                            let _ = stream;
-                            self.sync_from_snapshot(client).await?;
-                            return Ok(true);
-                        }
-                        Err(e) => return Err((*e).clone().into()),
+            // Return immediately if the next read will hang
+            if std::pin::Pin::new(stream).peek().await.is_none() {
+                return Ok(true);
+            }
+
+            let stream = client.stream.as_mut().unwrap();
+            match stream.next().await {
+                Some(Ok(frame)) => {
+                    let frame = Frame::try_from_bytes(frame.data)?;
+                    tracing::trace!(
+                        "Received frame {frame:?}, buffer has {} frames, size_after={}",
+                        buffer.len(),
+                        frame.header().size_after
+                    );
+                    buffer.push(frame.clone());
+                    if frame.header().size_after != 0
+                        || buffer.len() > MAX_REPLICA_REPLICATION_BUFFER_LEN
+                    {
+                        tracing::trace!("Sending {} frames to the injector", buffer.len());
+                        let _ = self
+                            .frames_sender
+                            .send(Frames::Vec(std::mem::take(&mut buffer)))
+                            .await;
+                        // Let's return here to indicate that we made progress.
+                        // There may be more data in the stream and it's fine, the user would just ask to sync again.
+                        return Ok(frame.header().size_after != 0);
                     }
                 }
+                Some(Err(err))
+                    if err.code() == tonic::Code::FailedPrecondition
+                        && err.message() == "NEED_SNAPSHOT" =>
+                {
+                    tracing::info!("loading snapshot");
+                    // remove any outstanding frames in the buffer that are not part of a
+                    // transaction: they are now part of the snapshot.
+                    buffer.clear();
+                    let _ = stream;
+                    self.sync_from_snapshot(client).await?;
+                    return Ok(true);
+                }
+                Some(Err(e)) => return Err(e.into()),
                 None => return Ok(true),
             }
         }
