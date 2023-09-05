@@ -1,5 +1,8 @@
-use crate::{Connection, Result};
 use std::ops::Deref;
+
+use crate::Result;
+
+use super::Connection;
 
 pub enum TransactionBehavior {
     Deferred,
@@ -14,75 +17,18 @@ pub enum DropBehavior {
     Ignore,
     Panic,
 }
-
 pub struct Transaction {
-    conn: Connection,
-    drop_behavior: DropBehavior,
-}
-
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        if self.conn.is_autocommit() {
-            return;
-        }
-        match self.drop_behavior {
-            DropBehavior::Rollback => {
-                self.do_rollback().unwrap();
-            }
-            DropBehavior::Commit => {
-                self.do_commit().unwrap();
-            }
-            DropBehavior::Ignore => {}
-            DropBehavior::Panic => {
-                if !std::thread::panicking() {
-                    panic!("Transaction dropped without being committed or rolled back");
-                }
-            }
-        }
-    }
+    pub(super) inner: Box<dyn Tx + Send + Sync>,
+    pub(super) conn: Connection,
 }
 
 impl Transaction {
-    pub fn drop_behavior(&self) -> DropBehavior {
-        self.drop_behavior
+    pub async fn commit(mut self) -> Result<()> {
+        self.inner.commit().await
     }
 
-    pub fn set_drop_behavior(&mut self, drop_behavior: DropBehavior) {
-        self.drop_behavior = drop_behavior
-    }
-
-    /// Begin a new transaction in the given mode.
-    pub(crate) fn begin(conn: Connection, tx_behavior: TransactionBehavior) -> Result<Self> {
-        let begin_stmt = match tx_behavior {
-            TransactionBehavior::Deferred => "BEGIN DEFERRED",
-            TransactionBehavior::Immediate => "BEGIN IMMEDIATE",
-            TransactionBehavior::Exclusive => "BEGIN EXCLUSIVE",
-        };
-        let _ = conn.execute(begin_stmt, ())?;
-        Ok(Self {
-            conn,
-            drop_behavior: DropBehavior::Rollback,
-        })
-    }
-
-    /// Commit the transaction.
-    pub fn commit(self) -> Result<()> {
-        self.do_commit()
-    }
-
-    fn do_commit(&self) -> Result<()> {
-        let _ = self.conn.execute("COMMIT", ())?;
-        Ok(())
-    }
-
-    /// Rollback the transaction.
-    pub fn rollback(self) -> Result<()> {
-        self.do_rollback()
-    }
-
-    fn do_rollback(&self) -> Result<()> {
-        let _ = self.conn.execute("ROLLBACK", ())?;
-        Ok(())
+    pub async fn rollback(mut self) -> Result<()> {
+        self.inner.rollback().await
     }
 }
 
@@ -92,5 +38,26 @@ impl Deref for Transaction {
     #[inline]
     fn deref(&self) -> &Connection {
         &self.conn
+    }
+}
+
+#[async_trait::async_trait]
+pub(super) trait Tx {
+    async fn commit(&mut self) -> Result<()>;
+    async fn rollback(&mut self) -> Result<()>;
+}
+
+pub(super) struct LibsqlTx(pub(super) Option<crate::Transaction>);
+
+#[async_trait::async_trait]
+impl Tx for LibsqlTx {
+    async fn commit(&mut self) -> Result<()> {
+        let tx = self.0.take().expect("Tx already dropped");
+        tx.commit()
+    }
+
+    async fn rollback(&mut self) -> Result<()> {
+        let tx = self.0.take().expect("Tx already dropped");
+        tx.rollback()
     }
 }

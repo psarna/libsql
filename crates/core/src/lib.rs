@@ -1,55 +1,15 @@
-//! # libSQL API for Rust
-//!
-//! libSQL is an embeddable SQL database engine based on SQLite.
-//! This Rust API is a batteries-included wrapper around the SQLite C API to support transparent replication while retaining compatibility with the SQLite ecosystem, such as the SQL dialect and extensions. If you are building an application in Rust, this is the crate you should use.
-//! There are also libSQL language bindings of this Rust crate to other languages such as [JavaScript](), Python, Go, and C.
-//!
-//! ## Getting Started
-//!
-//! To get started, you first need to create a [`Database`] object and then open a [`Connection`] to it, which you use to query:
-//!
-//! ```rust,no_run
-//! use libsql::Database;
-//!
-//! let db = Database::open(":memory:").unwrap();
-//! let conn = db.connect().unwrap();
-//! conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ()) .unwrap();
-//! conn.execute("INSERT INTO users (email) VALUES ('alice@example.org')", ()).unwrap();
-//! ```
-//!
-//! ## Embedded Replicas
-//!
-//! Embedded replica is libSQL database that's running in your application process, which keeps a local copy of a remote database.
-//! They are useful if you want to move data in the memory space of your application for fast access.
-//!
-//! You can open an embedded read-only replica by using the [`Database::with_replicator`] constructor:
-//!
-//! ```rust,no_run
-//! # async fn run() {
-//! use libsql::{Database, Opts};
-//! use libsql_replication::{Frame, Frames, Replicator};
-//!
-//! let mut db = Database::open_with_opts("/tmp/test.db", Opts::with_sync()).await.unwrap();
-//!
-//! let frames = Frames::Vec(vec![]);
-//! db.sync_frames(frames).unwrap();
-//! let conn = db.connect().unwrap();
-//! conn.execute("SELECT * FROM users", ()).unwrap();
-//! # }
-//! ```
-//!
-//! ## Examples
-//!
-//! You can find more examples in the [`examples`](https://github.com/penberg/libsql-experimental/tree/libsql-api/crates/core/examples) directory.
-
+pub mod hrana;
+pub mod rows;
+pub mod statement;
+pub mod transaction;
 pub mod connection;
 pub mod database;
 pub mod errors;
 pub mod params;
-pub mod rows;
-pub mod statement;
-pub mod transaction;
-pub mod v2;
+
+mod legacy_v1;
+
+use std::sync::Arc;
 
 pub type Result<T> = std::result::Result<T, errors::Error>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -58,7 +18,6 @@ pub use libsql_sys::ffi;
 pub use libsql_sys::ValueType;
 
 pub use connection::Connection;
-pub use database::Database;
 #[cfg(feature = "replication")]
 pub use database::Opts;
 pub use errors::Error;
@@ -66,8 +25,7 @@ pub use params::Params;
 pub use params::{params_from_iter, Value, ValueRef};
 pub use rows::Row;
 pub use rows::Rows;
-pub use rows::RowsFuture;
-pub use statement::{Column, Statement};
+pub use statement::{Column, Statement, LibsqlStmt};
 pub use transaction::{Transaction, TransactionBehavior};
 
 /// Return the version of the underlying SQLite library as a number.
@@ -81,5 +39,221 @@ pub fn version() -> &'static str {
         std::ffi::CStr::from_ptr(ffi::sqlite3_libversion())
             .to_str()
             .unwrap()
+    }
+}
+
+pub use hrana::{Client, HranaError};
+
+// TODO(lucio): Improve construction via
+//      1) Move open errors into open fn rather than connect
+//      2) Support replication setup
+enum DbType {
+    Memory,
+    File { path: String },
+    Sync { db: database::Database },
+    Remote { url: String, auth_token: String },
+}
+
+pub struct Database {
+    db_type: DbType,
+}
+
+impl Database {
+    pub fn open_in_memory() -> Result<Self> {
+        Ok(Database {
+            db_type: DbType::Memory,
+        })
+    }
+
+    pub fn open(db_path: impl Into<String>) -> Result<Database> {
+        Ok(Database {
+            db_type: DbType::File {
+                path: db_path.into(),
+            },
+        })
+    }
+
+    pub async fn open_with_sync(
+        db_path: impl Into<String>,
+        url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Database> {
+        let opts = crate::Opts::with_http_sync(url, token);
+        let db = database::Database::open_with_opts(db_path, opts).await?;
+        Ok(Database {
+            db_type: DbType::Sync { db },
+        })
+    }
+
+    pub fn open_remote(url: impl Into<String>, auth_token: impl Into<String>) -> Result<Self> {
+        Ok(Database {
+            db_type: DbType::Remote {
+                url: url.into(),
+                auth_token: auth_token.into(),
+            },
+        })
+    }
+
+    pub async fn connect(&self) -> Result<Connection> {
+        match &self.db_type {
+            DbType::Memory => {
+                let db = database::Database::open(":memory:")?;
+                let conn = db.connect()?;
+
+                let conn = Arc::new(LibsqlConnection { conn });
+
+                Ok(Connection { conn })
+            }
+
+            DbType::File { path } => {
+                let db = database::Database::open(path)?;
+                let conn = db.connect()?;
+
+                let conn = Arc::new(LibsqlConnection { conn });
+
+                Ok(Connection { conn })
+            }
+
+            DbType::Sync { db } => {
+                let conn = db.connect()?;
+
+                let conn = Arc::new(LibsqlConnection { conn });
+
+                Ok(Connection { conn })
+            }
+
+            DbType::Remote { url, auth_token } => {
+                let conn = Arc::new(hrana::Client::new(url, auth_token));
+
+                Ok(Connection { conn })
+            }
+        }
+    }
+
+    pub async fn sync(&self) -> Result<usize> {
+        match &self.db_type {
+            DbType::Sync { db } => db.sync().await,
+            DbType::Memory => Err(crate::Error::SyncNotSupported("in-memory".into())),
+            DbType::File { .. } => Err(crate::Error::SyncNotSupported("file".into())),
+            DbType::Remote { .. }=> Err(crate::Error::SyncNotSupported("remote".into())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+trait Conn {
+    async fn execute(&self, sql: &str, params: Params) -> Result<u64>;
+
+    async fn execute_batch(&self, sql: &str) -> Result<()>;
+
+    async fn prepare(&self, sql: &str) -> Result<Statement>;
+
+    async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction>;
+
+    fn is_autocommit(&self) -> bool;
+
+    fn changes(&self) -> u64;
+
+    fn last_insert_rowid(&self) -> i64;
+}
+
+#[derive(Clone)]
+pub struct Connection {
+    conn: Arc<dyn Conn + Send + Sync>,
+}
+
+// TODO(lucio): Convert to using tryinto params
+impl Connection {
+    pub async fn execute(&self, sql: &str, params: impl Into<Params>) -> Result<u64> {
+        self.conn.execute(sql, params.into()).await
+    }
+
+    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql).await
+    }
+
+    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
+        self.conn.prepare(sql).await
+    }
+
+    pub async fn query(&self, sql: &str, params: impl Into<Params>) -> Result<Rows> {
+        let stmt = self.prepare(sql).await?;
+
+        stmt.query(&params.into()).await
+    }
+
+    /// Begin a new transaction in DEFERRED mode, which is the default.
+    pub async fn transaction(&self) -> Result<Transaction> {
+        self.transaction_with_behavior(TransactionBehavior::Deferred)
+            .await
+    }
+
+    /// Begin a new transaction in the given mode.
+    pub async fn transaction_with_behavior(
+        &self,
+        tx_behavior: TransactionBehavior,
+    ) -> Result<Transaction> {
+        self.conn.transaction(tx_behavior).await
+    }
+
+    pub fn is_autocommit(&self) -> bool {
+       self.conn.is_autocommit()
+    }
+
+    pub fn changes(&self) -> u64 {
+       self.conn.changes()
+    }
+
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
+    }
+}
+
+#[derive(Clone)]
+struct LibsqlConnection {
+    conn: connection::Connection,
+}
+
+#[async_trait::async_trait]
+impl Conn for LibsqlConnection {
+    async fn execute(&self, sql: &str, params: Params) -> Result<u64> {
+        self.conn.execute(sql, params)
+    }
+
+    async fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)
+    }
+
+    async fn prepare(&self, sql: &str) -> Result<Statement> {
+        let sql = sql.to_string();
+
+        let stmt = self.conn.prepare(sql)?;
+
+        Ok(Statement {
+            inner: Arc::new(LibsqlStmt(stmt)),
+        })
+    }
+
+    async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction> {
+        let tx = crate::Transaction::begin(self.conn.clone(), tx_behavior)?;
+        // TODO(lucio): Can we just use the conn passed to the transaction?
+        Ok(Transaction {
+            inner: Box::new(LibsqlTx(Some(tx))),
+            conn: Connection {
+                conn: Arc::new(self.clone()),
+            },
+        })
+    }
+
+    fn is_autocommit(&self) -> bool {
+       self.conn.is_autocommit()
+    }
+
+    fn changes(&self) -> u64 {
+        self.conn.changes()
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
     }
 }

@@ -1,110 +1,66 @@
-use crate::{errors, Connection, Error, Params, Result, Statement, Value};
+use crate::{Result, Value};
+
 use libsql_sys::ValueType;
 
-use std::cell::RefCell;
-use std::ffi::c_char;
+pub(super) trait RowsInner {
+    fn next(&mut self) -> Result<Option<Row>>;
 
-/// Query result rows.
-#[derive(Debug, Clone)]
-pub struct Rows {
-    pub(crate) stmt: Statement,
-    pub(crate) err: RefCell<Option<(i32, i32, String)>>,
+    fn column_count(&self) -> i32;
+
+    fn column_name(&self, idx: i32) -> Option<&str>;
+
+    fn column_type(&self, idx: i32) -> Result<ValueType>;
 }
 
-unsafe impl Send for Rows {} // TODO: is this safe?
-unsafe impl Sync for Rows {} // TODO: is this safe?
+pub struct Rows {
+    pub(super) inner: Box<dyn RowsInner + Send + Sync>,
+}
 
 impl Rows {
-    pub fn new(stmt: Statement) -> Rows {
-        Rows {
-            stmt,
-            err: RefCell::new(None),
-        }
-    }
-
-    pub fn next(&self) -> Result<Option<Row>> {
-        let err;
-        let err_code;
-        let err_msg;
-        if let Some((e, code, msg)) = self.err.take() {
-            err = e;
-            err_code = code;
-            err_msg = msg;
-        } else {
-            err = self.stmt.inner.step();
-            err_code = errors::extended_error_code(self.stmt.conn.raw);
-            err_msg = errors::error_from_handle(self.stmt.conn.raw);
-        }
-        match err as u32 {
-            libsql_sys::ffi::SQLITE_OK => Ok(None),
-            libsql_sys::ffi::SQLITE_DONE => Ok(None),
-            libsql_sys::ffi::SQLITE_ROW => Ok(Some(Row {
-                stmt: self.stmt.clone(),
-            })),
-            _ => Err(Error::FetchRowFailed(err_code, err_msg)),
-        }
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Row>> {
+        self.inner.next()
     }
 
     pub fn column_count(&self) -> i32 {
-        self.stmt.inner.column_count()
+        self.inner.column_count()
     }
 
     pub fn column_name(&self, idx: i32) -> Option<&str> {
-        self.stmt.inner.column_name(idx)
+        self.inner.column_name(idx)
     }
 
     pub fn column_type(&self, idx: i32) -> Result<ValueType> {
-        let val = self.stmt.inner.column_type(idx);
-        match val as u32 {
-            libsql_sys::ffi::SQLITE_INTEGER => Ok(ValueType::Integer),
-            libsql_sys::ffi::SQLITE_FLOAT => Ok(ValueType::Real),
-            libsql_sys::ffi::SQLITE_BLOB => Ok(ValueType::Blob),
-            libsql_sys::ffi::SQLITE_TEXT => Ok(ValueType::Text),
-            libsql_sys::ffi::SQLITE_NULL => Ok(ValueType::Null),
-            _ => Err(Error::UnknownColumnType(idx, val)),
-        }
+        self.inner.column_type(idx)
     }
 }
 
-impl AsRef<Statement> for Rows {
-    fn as_ref(&self) -> &Statement {
-        &self.stmt
+pub(super) struct LibsqlRows(pub(super) crate::Rows);
+
+impl RowsInner for LibsqlRows {
+    fn next(&mut self) -> Result<Option<Row>> {
+        let row = self.0.next()?.map(|r| Row {
+            inner: Box::new(LibsqlRow(r)),
+        });
+
+        Ok(row)
     }
-}
 
-pub struct RowsFuture {
-    pub(crate) conn: Connection,
-    pub(crate) sql: String,
-    pub(crate) params: Params,
-}
-
-impl RowsFuture {
-    pub fn wait(&mut self) -> Result<Option<Rows>> {
-        futures::executor::block_on(self)
+    fn column_count(&self) -> i32 {
+        self.0.column_count()
     }
-}
 
-impl futures::Future for RowsFuture {
-    type Output = Result<Option<Rows>>;
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.0.column_name(idx)
+    }
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let stmt = self.conn.prepare(&self.sql)?;
-        let ret = stmt.query(&self.params)?;
-        std::task::Poll::Ready(Ok(Some(ret)))
+    fn column_type(&self, idx: i32) -> Result<ValueType> {
+        self.0.column_type(idx)
     }
 }
 
 pub struct Row {
-    pub(crate) stmt: Statement,
-}
-
-impl AsRef<Statement> for Row {
-    fn as_ref(&self) -> &Statement {
-        &self.stmt
-    }
+    pub(super) inner: Box<dyn RowInner + Send + Sync>,
 }
 
 impl Row {
@@ -112,152 +68,134 @@ impl Row {
     where
         T: FromValue,
     {
-        let val = self.stmt.inner.column_value(idx);
+        let val = self.inner.column_value(idx)?;
         T::from_sql(val)
     }
 
     pub fn get_value(&self, idx: i32) -> Result<Value> {
-        let val = self.stmt.inner.column_value(idx);
-        <crate::Value as FromValue>::from_sql(val)
+        self.inner.column_value(idx)
     }
 
-    pub fn column_type(&self, idx: i32) -> Result<ValueType> {
-        let val = self.stmt.inner.column_type(idx);
-        match val as u32 {
-            libsql_sys::ffi::SQLITE_INTEGER => Ok(ValueType::Integer),
-            libsql_sys::ffi::SQLITE_FLOAT => Ok(ValueType::Real),
-            libsql_sys::ffi::SQLITE_BLOB => Ok(ValueType::Blob),
-            libsql_sys::ffi::SQLITE_TEXT => Ok(ValueType::Text),
-            libsql_sys::ffi::SQLITE_NULL => Ok(ValueType::Null),
-            _ => Err(Error::UnknownColumnType(idx, val)),
-        }
+    pub fn get_str(&self, idx: i32) -> Result<&str> {
+        self.inner.column_str(idx)
     }
 
     pub fn column_name(&self, idx: i32) -> Option<&str> {
-        self.stmt.inner.column_name(idx)
+        self.inner.column_name(idx)
     }
 
-    pub fn get_ref(&self, idx: i32) -> Result<crate::params::ValueRef<'_>> {
-        Ok(crate::Statement::value_ref(&self.stmt.inner, idx as usize))
+    pub fn column_type(&self, idx: i32) -> Result<ValueType> {
+        self.inner.column_type(idx)
     }
 }
 
 pub trait FromValue {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self>
+    fn from_sql(val: Value) -> Result<Self>
     where
         Self: Sized;
 }
 
 impl FromValue for crate::Value {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        Ok(val.into())
+    fn from_sql(val: Value) -> Result<Self> {
+        Ok(val)
     }
 }
 
 impl FromValue for i32 {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.int();
-        Ok(ret)
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Integer(i) => Ok(i as i32),
+            _ => unreachable!("invalid value type"),
+        }
     }
 }
 
 impl FromValue for u32 {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.int() as u32;
-        Ok(ret)
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Integer(i) => Ok(i as u32),
+            _ => unreachable!("invalid value type"),
+        }
     }
 }
 
 impl FromValue for i64 {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.int64();
-        Ok(ret)
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Integer(i) => Ok(i),
+            _ => unreachable!("invalid value type"),
+        }
     }
 }
 
 impl FromValue for u64 {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.int64() as u64;
-        Ok(ret)
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Integer(i) => Ok(i as u64),
+            _ => unreachable!("invalid value type"),
+        }
     }
 }
 
 impl FromValue for f64 {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.double();
-        Ok(ret)
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Real(f) => Ok(f),
+            _ => unreachable!("invalid value type"),
+        }
     }
 }
 
 impl FromValue for Vec<u8> {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.blob();
-        if ret.is_null() {
-            return Err(Error::NullValue);
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Blob(blob) => Ok(blob),
+            _ => unreachable!("invalid value type"),            
         }
-        let ret = unsafe { std::slice::from_raw_parts(ret as *const u8, val.bytes() as usize) };
-        Ok(ret.to_vec())
     }
 }
 
 impl FromValue for String {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.text();
-        if ret.is_null() {
-            return Err(Error::NullValue);
+    fn from_sql(val: Value) -> Result<Self> {
+        match val {
+            Value::Null => Err(crate::Error::NullValue),
+            Value::Text(s) => {
+                Ok(s)
+            }
+            _ => unreachable!("invalid value type"),
         }
-        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const c_char) };
-        let ret = ret.to_str().unwrap();
-        Ok(ret.to_string())
     }
 }
 
-impl FromValue for &[u8] {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.blob();
-        if ret.is_null() {
-            return Err(Error::NullValue);
-        }
-        let ret = unsafe { std::slice::from_raw_parts(ret as *const u8, val.bytes() as usize) };
-        Ok(ret)
+pub(super) trait RowInner {
+    fn column_value(&self, idx: i32) -> Result<Value>;
+    fn column_str(&self, idx: i32) -> Result<&str>;
+    fn column_name(&self, idx: i32) -> Option<&str>;
+    fn column_type(&self, idx: i32) -> Result<ValueType>;
+}
+
+struct LibsqlRow(crate::Row);
+
+impl RowInner for LibsqlRow {
+    fn column_value(&self, idx: i32) -> Result<Value> {
+        self.0.get_value(idx)
     }
-}
 
-impl FromValue for &str {
-    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
-        let ret = val.text();
-        if ret.is_null() {
-            return Err(Error::NullValue);
-        }
-        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const c_char) };
-        let ret = ret.to_str().unwrap();
-        Ok(ret)
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.0.column_name(idx)
     }
-}
 
-pub struct MappedRows<F> {
-    rows: Rows,
-    map: F,
-}
-
-impl<F> MappedRows<F> {
-    pub fn new(rows: Rows, map: F) -> Self {
-        Self { rows, map }
+    fn column_str(&self, idx: i32) -> Result<&str> {
+        self.0.get::<&str>(idx)
     }
-}
 
-impl<F, T> Iterator for MappedRows<F>
-where
-    F: FnMut(Row) -> Result<T>,
-{
-    type Item = Result<T>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let map = &mut self.map;
-        self.rows
-            .next()
-            .transpose()
-            .map(|row_result| row_result.and_then(map))
+    fn column_type(&self, idx: i32) -> Result<ValueType> {
+        self.0.column_type(idx)
     }
 }
